@@ -1,0 +1,1172 @@
+#include "dbscan.h"
+#include "global_tracker.h"
+#include "gstnvdsmeta.h"
+#include "nvbufsurface.h"
+#include "nvds_obj_encode.h"
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <cuda_runtime_api.h>
+#include <glib.h>
+#include <gst/gst.h>
+#include <gstnvdsmeta.h>
+#include <iostream>
+#include <map>
+#include <nvds_tracker_meta.h>
+#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
+#include <opencv2/core/types.hpp>
+#include <opencv2/opencv.hpp>
+#include <stdio.h>
+#include <unordered_set>
+#include <json-glib/json-glib.h>
+
+#define PGIE_CLASS_ID_PERSON 0
+#define FPS_PRINT_INTERVAL 300
+// PGIE Output Saving cropped bbox and attach user meta data
+#define save_img FALSE
+#define attach_user_meta TRUE
+#define MSCONV_CONFIG_FILE "dstest4_msgconv_config.txt"
+// #define MAX_CLUSTER_POINTS 50  // choose suitable max
+// struct ClusterMeta {
+//     int frame_num;
+//     int source_id;
+//     int num_centroids;
+//     float centroids[MAX_CLUSTER_POINTS][2]; // x and y
+// };
+
+// PGIE Config
+#define MAX_DISPLAY_LEN 64
+#define PGIE_CLASS_ID_PERSON 0
+
+// Streammux Config
+#define MUXER_OUTPUT_WIDTH 1280
+#define MUXER_OUTPUT_HEIGHT 720
+#define MUXER_BATCH_TIMEOUT_USEC 40000
+
+// On-Screen Display Config
+#define TILED_OUTPUT_WIDTH 1280
+#define TILED_OUTPUT_HEIGHT 720
+
+#define FRAME_SYNC TRUE
+#define CLUSTER_META_TYPE nvds_get_user_meta_type((gchar*)"CLUSTER_META")
+
+// Root Path for Video Streams
+#define DATA_ROOT "file:///opt/nvidia/deepstream/deepstream-7.1/peopletrack/mcmt"
+
+// DATA STREAMS
+std::array<std::string, 4> STREAMS = {
+    "cam_139.mp4",
+    "cam_140.mp4",
+    "cam_142.mp4",
+    "cam_52.mp4"
+};
+
+/* NVIDIA Decoder source pad memory feature. This feature signifies that source
+ * pads having this capability will push GstBuffers containing cuda buffers. */
+#define GST_CAPS_FEATURES_NVMM "memory:NVMM"
+
+#define MAX_TIME_STAMP_LEN (64)
+
+#define CLUSTER_META_TYPE nvds_get_user_meta_type((gchar*)"CLUSTER_META")
+
+static void
+generate_ts_rfc3339(char* buf, int buf_size)
+{
+    time_t tloc;
+    struct tm tm_log;
+    struct timespec ts;
+    char strmsec[6];  //.nnnZ\0
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    memcpy(&tloc, (void*)(&ts.tv_sec), sizeof(time_t));
+    gmtime_r(&tloc, &tm_log);
+    strftime(buf, buf_size, "%Y-%m-%dT%H:%M:%S", &tm_log);
+    int ms = ts.tv_nsec / 1000000;
+    g_snprintf(strmsec, sizeof(strmsec), ".%.3dZ", ms);
+    strncat(buf, strmsec, buf_size);
+}
+
+static gboolean PERF_MODE = TRUE;
+
+std::map<guint, std::pair<std::chrono::steady_clock::time_point, int>> frame_count_map;
+
+// Create a struct to hold time, count, and latest FPS
+struct FpsCounter {
+    std::chrono::steady_clock::time_point last_time;
+    int frame_count = 0;
+    float fps = 0.0f;
+};
+
+bool is_valid_bev(const cv::Point2f& pt)
+{
+    return pt.x >= 0 && pt.y >= 0; // You may extend this to a valid BEV space
+}
+
+struct ClusterMeta {
+    int frame_num;
+    std::vector<cv::Point2f> centroids;
+    int source_id;
+};
+
+
+static gpointer copy_cluster_meta(gpointer data, gpointer user_data) {
+    // ClusterMeta* src = (ClusterMeta*)data;
+    // ClusterMeta* dst = new ClusterMeta();
+
+    NvDsUserMeta *user_meta = (NvDsUserMeta *)data;
+    ClusterMeta* src = (ClusterMeta*)user_meta->user_meta_data;
+    
+    if (!src) return nullptr;
+
+    ClusterMeta* dst = new ClusterMeta();
+    dst->frame_num = src->frame_num;
+    dst->centroids = src->centroids;  // deep copy
+    dst->source_id = src->source_id;
+
+    return (gpointer)dst;
+}
+
+static void free_cluster_meta(gpointer data, gpointer user_data) {
+    NvDsUserMeta* user_meta = (NvDsUserMeta*)data;
+
+    delete (ClusterMeta*)user_meta->user_meta_data;
+    user_meta->user_meta_data = nullptr;
+    // ClusterMeta* meta = (ClusterMeta*)data;
+    // delete meta;
+}
+
+// Declare this early in your code or in a shared header
+typedef struct {
+    gchar *message;
+    gsize size;
+} NvDsCustomMsgInfo;
+
+
+
+static gpointer
+meta_copy_func_custom (gpointer data, gpointer user_data)
+{
+  NvDsUserMeta *user_meta = (NvDsUserMeta *) data;
+  NvDsCustomMsgInfo *srcMeta = (NvDsCustomMsgInfo *) user_meta->user_meta_data;
+  NvDsCustomMsgInfo *dstMeta = NULL;
+
+  dstMeta = (NvDsCustomMsgInfo *) g_memdup2 (srcMeta, sizeof (NvDsCustomMsgInfo));
+
+  if (srcMeta->message)
+    dstMeta->message =  g_strdup ((const char*)srcMeta->message);
+  dstMeta->size = srcMeta->size;
+
+  return dstMeta;
+}
+
+static void
+meta_free_func_custom (gpointer data, gpointer user_data)
+{
+  NvDsUserMeta *user_meta = (NvDsUserMeta *) data;
+  NvDsCustomMsgInfo *srcMeta = (NvDsCustomMsgInfo *) user_meta->user_meta_data;
+
+  if (srcMeta->message)
+    g_free (srcMeta->message);
+  srcMeta->size = 0;
+
+  g_free (user_meta->user_meta_data);
+}
+
+
+gchar* generate_dsmeta_message_custom(void* privData, void* frameMeta, void* objMeta)
+{
+    JsonNode* rootNode = NULL;
+    JsonObject* jobject = NULL;
+    gchar* message = NULL;
+
+    if (!frameMeta) {
+        g_printerr("[ERROR] frameMeta is NULL\n");
+        return NULL;
+    }
+
+    NvDsFrameMeta* frame_meta = (NvDsFrameMeta*)frameMeta;
+
+    // g_print("[DEBUG] Generating message for frame %d, source ID %d\n", frame_meta->frame_num, frame_meta->source_id);
+
+    // Generate timestamp
+    char ts[MAX_TIME_STAMP_LEN + 1] = {0};
+    generate_ts_rfc3339(ts, MAX_TIME_STAMP_LEN);
+    // g_print("[DEBUG] Timestamp generated: %s\n", ts);
+
+    // jobject = json_object_new();
+    // if (!jobject) {
+    //     g_printerr("[ERROR] Failed to create root JSON object\n");
+    //     return NULL;
+    // }
+
+    if (frame_meta->frame_user_meta_list == nullptr) {
+        g_print("[DEBUG] frame_user_meta_list is NULL\n");
+    }
+
+    for (NvDsUserMetaList* l = frame_meta->frame_user_meta_list; l!=nullptr; l = l->next) {
+        // g_print("[DEBUG] CLUSTER_META_TYPE CHECKING in frame %d source %d\n", frame_meta->frame_num, frame_meta->source_id);
+        NvDsUserMeta* user_meta = (NvDsUserMeta*)l->data;
+        if (!user_meta) {
+            g_printerr("[WARNING] user_meta is NULL in user meta list\n");
+            continue;
+        }
+
+        jobject = json_object_new();
+        std::cout << user_meta->base_meta.meta_type << std::endl;
+        if (user_meta->base_meta.meta_type == CLUSTER_META_TYPE) {
+            g_print("[DEBUG] CLUSTER_META_TYPE found in frame %d source %d\n", frame_meta->frame_num, frame_meta->source_id);
+
+
+            json_object_set_string_member(jobject, "frame_num", std::to_string(frame_meta->frame_num).c_str());
+            json_object_set_string_member(jobject, "source_id", std::to_string(frame_meta->source_id).c_str());
+            json_object_set_string_member(jobject, "@timestamp", ts);
+            ClusterMeta* cluster_data = (ClusterMeta*)user_meta->user_meta_data;
+            if (!cluster_data) {
+                g_printerr("[ERROR] ClusterMeta pointer is NULL\n");
+                continue;
+            }
+
+
+            g_print("[DEBUG] ClusterMeta has %lu centroids\n", cluster_data->centroids.size());
+
+            // g_print("[DEBUG] ClusterMeta pointer: %p\n", cluster_data);
+            // g_print("[DEBUG] ClusterMeta frame_num: %d\n", cluster_data->frame_num);
+            // g_print("[DEBUG] ClusterMeta centroid size: %lu\n", cluster_data->centroids.size());
+
+            g_print("[DEBUG] frame_meta ptr: %p, frame_num: %d, source_id: %d\n",
+                    frame_meta, frame_meta->frame_num, frame_meta->source_id);
+
+            JsonObject* clusterObj = json_object_new();
+            JsonArray* centroidArray = json_array_new();
+
+            for (size_t i = 0; i < cluster_data->centroids.size(); ++i) {
+                const auto& pt = cluster_data->centroids[i];
+                g_print("[DEBUG] Centroid %zu: x=%.2f, y=%.2f\n", i, pt.x, pt.y);
+
+                JsonObject* ptObj = json_object_new();
+                json_object_set_double_member(ptObj, "x", pt.x);
+                json_object_set_double_member(ptObj, "y", pt.y);
+                json_array_add_object_element(centroidArray, ptObj);
+            }
+
+            json_object_set_array_member(clusterObj, "centroids", centroidArray);
+            json_object_set_object_member(jobject, "clusterMeta", clusterObj);
+            
+            rootNode = json_node_new(JSON_NODE_OBJECT);
+            if (!rootNode) {
+                g_printerr("[ERROR] Failed to create JSON root node\n");
+                json_object_unref(jobject);
+                return NULL;
+            }
+
+            json_node_set_object(rootNode, jobject);
+
+            message = json_to_string(rootNode, TRUE);
+            if (message) {
+                g_print("[DEBUG] Final JSON message: %s\n", message);
+            } else {
+                g_printerr("[ERROR] Failed to convert JSON to string\n");
+            }
+
+            json_node_free(rootNode);
+            json_object_unref(jobject);
+
+            return message;
+        }
+    }
+    return NULL; 
+}
+
+
+struct BevProbeContext {
+    std::map<int, std::map<int, std::vector<ObjectInfo>>> global_frame_map;
+
+    std::unordered_map<int, cv::Mat> homography_map = {
+        { 0, (cv::Mat_<double>(3, 3) << 2.40866514, 1.28848853, 252.233162, 2.26850712, 6.19147141, -2766.28654, -0.000353594645, 0.0142827565, 1.0) },
+
+        { 1, (cv::Mat_<double>(3, 3) << 0.621648542, -0.73801931, 38.1466853, 0.575893892, 1.64742213, -554.758669, -0.000476361243, 0.00389358242, 1.0) },
+
+        { 2, (cv::Mat_<double>(3, 3) << 0.679767122, 1.87127700, -330.556921, -0.550027795, 1.47485013, 344.567937, 0.000172266597, 0.00306967079, 1.0) },
+
+        { 3, (cv::Mat_<double>(3, 3) << -0.953208376, 0.434986773, 911.234222, -0.0225376263, -0.614695626, 690.339219, -0.000204759396, 0.00207282506, 1.0) }
+    };
+
+    static constexpr int expected_sources = 4; // <-- Remove `const` here, or make it `static constexpr`
+
+    GlobalTracker tracker;
+
+    std::unordered_map<int, FpsCounter> frame_count_map;
+};
+
+
+GstPadProbeReturn tracker_src_pad_buffer_probe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data)
+{
+    
+    GstBuffer* gst_buffer = gst_pad_probe_info_get_buffer(info);
+    if (!gst_buffer)
+        return GST_PAD_PROBE_OK;
+
+    NvDsBatchMeta* batch_meta = gst_buffer_get_nvds_batch_meta(gst_buffer);
+    if (!batch_meta)
+        return GST_PAD_PROBE_OK;
+
+    auto* ctx = static_cast<BevProbeContext*>(user_data);
+
+    for (NvDsMetaList* l_frame = batch_meta->frame_meta_list; l_frame != NULL; l_frame = l_frame->next) {
+        NvDsFrameMeta* frame_meta = (NvDsFrameMeta*)l_frame->data;
+        guint source_id = frame_meta->source_id;
+        guint frame_num = frame_meta->frame_num;
+
+        auto& objects = ctx->global_frame_map[frame_num][source_id];
+        std::vector<cv::Point2f> img_points;
+
+        for (NvDsMetaList* l_obj = frame_meta->obj_meta_list; l_obj != NULL; l_obj = l_obj->next) {
+            NvDsObjectMeta* obj_meta = (NvDsObjectMeta*)l_obj->data;
+
+            // Tracking ID
+            guint64 object_id = obj_meta->object_id;
+
+            int x = obj_meta->rect_params.left + obj_meta->rect_params.width / 2.0f;
+            int y = obj_meta->rect_params.top + obj_meta->rect_params.height;
+
+            ObjectInfo object;
+            object.obj_meta_ptr = obj_meta;
+            object.confidence = obj_meta->confidence;
+            object.source_id = frame_meta->source_id;
+            object.frame_num = frame_meta->frame_num;
+            object.bev_point = cv::Point2f(x, y);
+
+            img_points.push_back(object.bev_point);
+            objects.push_back(std::move(object));
+        }
+        // std::cout << "Frame num: "<< frame_meta->frame_num << " Source ID: " << frame_meta->source_id << " Objects:" << img_points.size() << std::endl;
+        if (!img_points.empty() && img_points.size() == objects.size()) {
+            std::vector<cv::Point2f> bev_points;
+            try {
+                cv::perspectiveTransform(img_points, bev_points, ctx->homography_map[source_id]);
+
+                for (size_t i = 0; i < bev_points.size(); ++i) {
+                    objects[i].bev_point = bev_points[i];
+                }
+
+            } catch (const cv::Exception& e) {
+                std::cerr << "[ERROR] Homography failed: " << e.what() << std::endl;
+            }
+        }
+        // ctx->global_frame_map[frame_num][source_id] = std::move(temp_objs);
+        // std::cout << "[INFO]1 Frame: " << frame_num << " Source: " << source_id << " Num Points: " << img_points.size() << std::endl;
+        // Check if we now have all 4 source frames for this frame_num
+        if (ctx->global_frame_map[frame_num].size() == BevProbeContext::expected_sources) {
+            std::vector<cv::Point2f> all_bev_points;
+            std::vector<ObjectInfo*> all_object_ptrs;
+
+            for (auto& [sid, obj_list] : ctx->global_frame_map[frame_num]) {
+                for (auto& obj : obj_list) {
+                    if (is_valid_bev(obj.bev_point)) {
+                        all_bev_points.push_back(obj.bev_point);
+                        all_object_ptrs.push_back(&obj);
+                    }
+                }
+            }
+
+            if (all_object_ptrs.empty()) {
+                std::cout << "[WARN] No objects found for Frame: " << frame_num << ". Skipping tracking.\n";
+                return GST_PAD_PROBE_OK;
+            }
+
+            std::vector<bool> clustered(all_object_ptrs.size(), false);
+            std::vector<std::vector<ObjectInfo*>> clusters;
+            float bev_thresh = 100.0f;
+
+            for (size_t i = 0; i < all_object_ptrs.size(); ++i) {
+                if (clustered[i])
+                    continue;
+
+                std::vector<ObjectInfo*> cluster;
+                std::unordered_set<int> used_sources;
+                cluster.push_back(all_object_ptrs[i]);
+                used_sources.insert(all_object_ptrs[i]->source_id);
+                clustered[i] = true;
+
+                for (size_t j = i + 1; j < all_object_ptrs.size(); ++j) {
+                    if (clustered[j])
+                        continue;
+                    if (used_sources.count(all_object_ptrs[j]->source_id))
+                        continue; // Prevent same-source
+
+                    float bev_dist = cv::norm(all_object_ptrs[i]->bev_point - all_object_ptrs[j]->bev_point);
+                    // float reid_dist = cosine_distance(all_objs[i]->reid_vector, all_objs[j]->reid_vector);
+                    float combined = bev_dist; // + beta * reid_dist * 100.0f;
+
+                    if (bev_dist < bev_thresh) {
+                        // (bev_dist < bev_thresh && reid_dist < reid_thresh && combined < 100.f)
+                        cluster.push_back(all_object_ptrs[j]);
+                        used_sources.insert(all_object_ptrs[j]->source_id);
+                        clustered[j] = true;
+                    }
+                }
+                clusters.push_back(cluster);
+            }
+
+            // Merge across sources
+            std::vector<cv::Point2f> cluster_centroids;
+
+            for (const auto& cluster : clusters) {
+                if (cluster.empty())
+                    continue;
+                cv::Point2f sum(0, 0);
+                for (auto* obj : cluster)
+                    sum += obj->bev_point;
+                cluster_centroids.push_back(sum * (1.0f / static_cast<float>(cluster.size())));
+            }
+
+            std::cout << "[INFO]2 Frame: " << frame_num << " | Total BEV points: " << all_bev_points.size()
+                      << " | Valid Clusters: " << cluster_centroids.size() << " | Clusters size: " << clusters.size() << std::endl;
+
+            if (cluster_centroids.empty()) {
+                std::cout << "[WARN] No valid clusters for Frame: " << frame_num << ". Skipping tracking.\n";
+                return GST_PAD_PROBE_OK;
+            }
+
+            // for (size_t i = 0; i < clusters.size(); ++i) {
+            //     int cluster_id = i;
+            //     for (auto* obj : clusters[i]) {
+            //         obj->global_id = cluster_id;
+            //         if (obj->obj_meta_ptr) {
+            //             obj->obj_meta_ptr->object_id =  cluster_id;
+            //             // std::cout << " Objectr ID clustered :" << obj->obj_meta_ptr->object_id << std::endl;
+            //         }
+            //     }
+            // }
+
+            std::vector<int> global_ids = ctx->tracker.assignGlobalIDsFromCentroids(cluster_centroids);
+
+            if (cluster_centroids.size() != global_ids.size()) {
+                std::cerr << "[ERROR] Mismatch in centroids and assigned global IDs\n";
+                return GST_PAD_PROBE_OK;
+            }
+
+            for (size_t i = 0;i < clusters.size();++i) {
+                int gid = global_ids[i];
+                for (auto* obj : clusters[i]) {
+                    obj->global_id = gid;
+                    if (obj->obj_meta_ptr){
+                        obj->obj_meta_ptr->object_id = gid;
+                    }
+                }
+            }
+            if (cluster_centroids.size()>0) {
+                NvDsUserMeta* user_meta = nvds_acquire_user_meta_from_pool(batch_meta);
+                ClusterMeta* cluster_meta = new ClusterMeta();
+                cluster_meta->frame_num = frame_num;
+                cluster_meta->centroids = cluster_centroids;
+                cluster_meta->source_id = frame_meta->source_id;
+
+
+                std::cout << "[ATTACH] Adding ClusterMeta to Frame " << frame_num
+                << " source " << frame_meta->source_id
+                << " with " << cluster_centroids.size()
+                << " centroids, ptr=" << cluster_meta << std::endl;
+
+
+
+                user_meta->user_meta_data = (gpointer)cluster_meta;
+                user_meta->base_meta.meta_type = CLUSTER_META_TYPE;
+                user_meta->base_meta.copy_func = (NvDsMetaCopyFunc)copy_cluster_meta;
+                user_meta->base_meta.release_func = (NvDsMetaReleaseFunc)free_cluster_meta;
+
+                nvds_add_user_meta_to_frame(frame_meta, user_meta);
+
+                gchar* json_msg = generate_dsmeta_message_custom(nullptr, frame_meta, nullptr);
+
+                if (json_msg) {
+                //     // ✅ 3. Create NvDsCustomMsgInfo object
+                    NvDsCustomMsgInfo *msg_custom_meta =
+                        (NvDsCustomMsgInfo *) g_malloc0(sizeof(NvDsCustomMsgInfo));
+                    msg_custom_meta->message = g_strdup(json_msg);
+                    msg_custom_meta->size = strlen(json_msg);
+
+                //     // ✅ 4. Wrap it inside NvDsUserMeta and attach as NVDS_CUSTOM_MSG_BLOB
+                    NvDsUserMeta *user_event_meta_custom =
+                        nvds_acquire_user_meta_from_pool(batch_meta);
+                    user_event_meta_custom->user_meta_data = (void *) msg_custom_meta;
+                    user_event_meta_custom->base_meta.meta_type = NVDS_CUSTOM_MSG_BLOB;
+                    user_event_meta_custom->base_meta.copy_func =
+                        (NvDsMetaCopyFunc) meta_copy_func_custom;
+                    user_event_meta_custom->base_meta.release_func =
+                        (NvDsMetaReleaseFunc) meta_free_func_custom;
+
+                    nvds_add_user_meta_to_frame(frame_meta, user_event_meta_custom);
+
+                    // g_free(json_msg);  // free original if you strdup'd inside generate_dsmeta_message_custom
+                } else {
+                    g_printerr("[ERROR] JSON generation failed. Skipping message blob attachment\n");
+                }
+            }
+
+            // // Cleanup after processing to save memory
+            if (frame_num >= 2)
+                ctx->global_frame_map.erase(frame_num-2);
+        }
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+
+
+
+
+GstPadProbeReturn tiler_sink_pad_buffer_probe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data)
+{
+    auto* ctx = static_cast<BevProbeContext*>(user_data);
+    if (!ctx || !info || !info->data)
+        return GST_PAD_PROBE_OK;
+
+    GstBuffer* buf = (GstBuffer*)info->data;
+    NvDsBatchMeta* batch_meta = gst_buffer_get_nvds_batch_meta(buf);
+    if (!batch_meta)
+        return GST_PAD_PROBE_OK;
+
+    for (NvDsMetaList* l_frame = batch_meta->frame_meta_list; l_frame != nullptr; l_frame = l_frame->next) {
+        NvDsFrameMeta* frame_meta = (NvDsFrameMeta*)(l_frame->data);
+
+        int frame_num = frame_meta->frame_num;
+        int source_id = frame_meta->source_id;
+
+        for (NvDsMetaList* l_user = frame_meta->frame_user_meta_list; l_user != nullptr; l_user = l_user->next) {
+            NvDsUserMeta* user_meta = (NvDsUserMeta*)l_user->data;
+
+            if (user_meta && user_meta->base_meta.meta_type == CLUSTER_META_TYPE) {
+               std::cout <<"MAIN" << CLUSTER_META_TYPE << std::endl;
+                g_print("[DEBUG][MAIN] CLUSTER_META_TYPE found in frame %d source %d\n", frame_meta->frame_num, frame_meta->source_id);
+                ClusterMeta* cluster_data = (ClusterMeta*)user_meta->user_meta_data;
+
+                if (cluster_data) {
+                    std::cout << "[CUSTOM META] Frame: " << cluster_data->frame_num
+                            << " | Centroids: " << cluster_data->centroids.size() << std::endl;
+
+                    for (size_t i = 0; i < cluster_data->centroids.size(); ++i) {
+                        const auto& pt = cluster_data->centroids[i];
+                        std::cout << "   Centroid " << i << ": (" << pt.x << ", " << pt.y << ")\n";
+                    }
+                } else {
+                    std::cerr << "[WARN] Custom meta present but null pointer!\n";
+                }
+            }
+        }
+
+
+        // Track FPS for each source
+        auto& counter = ctx->frame_count_map[source_id];
+        auto now = std::chrono::steady_clock::now();
+
+        if (counter.last_time.time_since_epoch().count() == 0) {
+            counter.last_time = now;
+        }
+
+        counter.frame_count++;
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - counter.last_time).count();
+        if (elapsed >= 1) {
+            counter.fps = counter.frame_count / static_cast<float>(elapsed);
+            counter.last_time = now;
+            counter.frame_count = 0;
+        }
+
+        // Acquire display meta from pool
+        NvDsDisplayMeta* display_meta = nvds_acquire_display_meta_from_pool(batch_meta);
+        display_meta->num_labels = 1;
+
+        // Use g_strdup_printf for safety
+        display_meta->text_params[0].display_text = g_strdup_printf(
+            "Stream: %d | Frame: %d | FPS: %.2f", source_id, frame_num, counter.fps);
+
+        int circle_index = 0;
+
+        // Iterate over detected objects
+        for (NvDsMetaList* l_obj = frame_meta->obj_meta_list; l_obj != nullptr; l_obj = l_obj->next) {
+            NvDsObjectMeta* obj_meta = (NvDsObjectMeta*)l_obj->data;
+
+            if (obj_meta->class_id == PGIE_CLASS_ID_PERSON) {
+                int x_foot = static_cast<int>(obj_meta->rect_params.left + obj_meta->rect_params.width / 2);
+                int y_foot = static_cast<int>(obj_meta->rect_params.top + obj_meta->rect_params.height);
+
+                if (obj_meta->text_params.display_text)
+                    g_free(obj_meta->text_params.display_text);
+
+
+                obj_meta->text_params.display_text = g_strdup_printf(
+                "Person ID:%lu: %.0f%% , X: %d Y: %d",//, BEV: %.1f, %.1f",
+                obj_meta->object_id, obj_meta->confidence * 100,
+                x_foot, y_foot);
+                    // Set visual rect display params
+                obj_meta->rect_params.has_bg_color = 1;
+                obj_meta->rect_params.bg_color = { 0.0, 0.0, 1.0, 0.5 };
+                obj_meta->rect_params.border_width = 1;
+
+                // Use detector bbox
+                NvBbox_Coords* detector_coords = &(obj_meta->detector_bbox_info.org_bbox_coords);
+                NvOSD_RectParams* rect_params = &display_meta->rect_params[circle_index];
+                rect_params->top = detector_coords->top;
+                rect_params->left = detector_coords->left;
+                rect_params->height = detector_coords->height;
+                rect_params->width = detector_coords->width;
+                rect_params->has_bg_color = 1;
+                rect_params->bg_color = { 0.0, 1.0, 0.0, 0.3 };
+                rect_params->border_color = { 0.0, 1.0, 1.0, 1.0 };
+                rect_params->border_width = 2;
+
+                if (obj_meta->confidence >= 0.5)
+                    display_meta->num_rects += 1;
+
+                circle_index++;
+            }
+        }
+
+        // Set overlay text font and position
+        display_meta->text_params[0].x_offset = 20;
+        display_meta->text_params[0].y_offset = 30 * (source_id + 1);
+        display_meta->text_params[0].font_params.font_name = (char*)"Serif";
+        display_meta->text_params[0].font_params.font_size = 12;
+        display_meta->text_params[0].font_params.font_color = { 1.0, 1.0, 1.0, 1.0 };
+        display_meta->text_params[0].set_bg_clr = 1;
+        display_meta->text_params[0].text_bg_clr = { 0.0, 0.0, 0.0, 1.0 };
+
+        // Attach meta to frame
+        nvds_add_display_meta_to_frame(frame_meta, display_meta);
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+
+/* pgie_src_pad_buffer_probe will extract metadata received on pgie src pad
+ * and update params for drawing rectangle, object information etc. We also
+ * iterate through the object list and encode the cropped objects as jpeg
+ * images and attach it as user meta to the respective objects.*/
+static GstPadProbeReturn
+pgie_src_pad_buffer_probe(GstPad* pad, GstPadProbeInfo* info, gpointer ctx)
+{
+    NvDsObjEncCtxHandle obj_ctx = (NvDsObjEncCtxHandle)ctx;
+    GstBuffer* buf = (GstBuffer*)info->data;
+    GstMapInfo inmap = GST_MAP_INFO_INIT;
+    if (!gst_buffer_map(buf, &inmap, GST_MAP_READ)) {
+        GST_ERROR("input buffer mapinfo failed");
+        return GST_PAD_PROBE_DROP;
+    }
+    NvBufSurface* ip_surf = (NvBufSurface*)inmap.data;
+    gst_buffer_unmap(buf, &inmap);
+
+    NvDsObjectMeta* obj_meta = NULL;
+    guint person_count = 0;
+    NvDsMetaList* l_frame = NULL;
+    NvDsMetaList* l_obj = NULL;
+    NvDsBatchMeta* batch_meta = gst_buffer_get_nvds_batch_meta(buf);
+    const gchar* calc_enc_str = g_getenv("CALCULATE_ENCODE_TIME");
+    gboolean calc_enc = !g_strcmp0(calc_enc_str, "yes");
+
+    for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
+        l_frame = l_frame->next) {
+        NvDsFrameMeta* frame_meta = (NvDsFrameMeta*)(l_frame->data);
+        /* For demonstration purposes, we will encode the first 10 frames. */
+        if (frame_meta->frame_num <= 10) {
+            NvDsObjEncUsrArgs frameData = { 0 };
+            /* Preset */
+            frameData.isFrame = 1;
+            /* To be set by user */
+            frameData.saveImg = save_img;
+            frameData.attachUsrMeta = attach_user_meta;
+            /* Set if Image scaling Required */
+            frameData.scaleImg = FALSE;
+            frameData.scaledWidth = 0;
+            frameData.scaledHeight = 0;
+            /* Quality */
+            frameData.quality = 80;
+            /* Set to calculate time taken to encode JPG image. */
+            if (calc_enc) {
+                frameData.calcEncodeTime = 1;
+            }
+            /* Main Function Call */
+            nvds_obj_enc_process(obj_ctx, &frameData, ip_surf, NULL, frame_meta);
+        }
+        guint num_rects = 0;
+        for (l_obj = frame_meta->obj_meta_list; l_obj != NULL; l_obj = l_obj->next) {
+            obj_meta = (NvDsObjectMeta*)(l_obj->data);
+
+            if (obj_meta->class_id == PGIE_CLASS_ID_PERSON) {
+                person_count++;
+                num_rects++;
+            }
+            /* Conditions that user needs to set to encode the detected objects of
+             * interest. Here, by default all the detected objects are encoded.
+             * For demonstration, we will encode the first object in the frame. */
+            if (obj_meta->class_id == PGIE_CLASS_ID_PERSON) {
+                NvDsObjEncUsrArgs objData = { 0 };
+                /* To be set by user */
+                objData.saveImg = save_img;
+                objData.attachUsrMeta = attach_user_meta;
+                /* Set if Image scaling Required */
+                objData.scaleImg = FALSE;
+                objData.scaledWidth = 0;
+                objData.scaledHeight = 0;
+                /* Preset */
+                objData.objNum = num_rects;
+                /* Quality */
+                objData.quality = 80;
+                /* Set to calculate time taken to encode JPG image. */
+                if (calc_enc) {
+                    objData.calcEncodeTime = 1;
+                }
+                /*Main Function Call */
+                nvds_obj_enc_process(obj_ctx, &objData, ip_surf, obj_meta, frame_meta);
+            }
+        }
+    }
+    nvds_obj_enc_finish(obj_ctx);
+    return GST_PAD_PROBE_OK;
+}
+
+static gboolean
+bus_call(GstBus* bus, GstMessage* msg, gpointer data)
+{
+    GMainLoop* loop = (GMainLoop*)data;
+    switch (GST_MESSAGE_TYPE(msg)) {
+    case GST_MESSAGE_EOS:
+        g_print("End of stream\n");
+        g_main_loop_quit(loop);
+        break;
+    case GST_MESSAGE_ERROR: {
+        gchar* debug = NULL;
+        GError* error = NULL;
+        gst_message_parse_error(msg, &error, &debug);
+        g_printerr("ERROR from element %s: %s\n",
+            GST_OBJECT_NAME(msg->src), error->message);
+        if (debug)
+            g_printerr("Error details: %s\n", debug);
+        g_free(debug);
+        g_error_free(error);
+        g_main_loop_quit(loop);
+        break;
+    }
+    default:
+        break;
+    }
+    return TRUE;
+}
+
+static void
+cb_newpad(GstElement* decodebin, GstPad* decoder_src_pad, gpointer data)
+{
+    GstCaps* caps = gst_pad_get_current_caps(decoder_src_pad);
+    if (!caps) {
+        caps = gst_pad_query_caps(decoder_src_pad, NULL);
+    }
+
+    if (!caps) {
+        g_printerr("Failed to get caps from pad\n");
+        return;
+    }
+
+    const GstStructure* str = gst_caps_get_structure(caps, 0);
+    const gchar* name = gst_structure_get_name(str);
+    GstElement* source_bin = (GstElement*)data;
+    GstCapsFeatures* features = gst_caps_get_features(caps, 0);
+
+    /* Need to check if the pad created by the decodebin is for video and not
+     * audio. */
+    if (!strncmp(name, "video", 5)) {
+        /* Link the decodebin pad only if decodebin has picked nvidia
+         * decoder plugin nvdec_*. We do this by checking if the pad caps contain
+         * NVMM memory features. */
+        if (gst_caps_features_contains(features, GST_CAPS_FEATURES_NVMM)) {
+            /* Get the source bin ghost pad */
+            GstPad* bin_ghost_pad = gst_element_get_static_pad(source_bin, "src");
+            if (!gst_ghost_pad_set_target(GST_GHOST_PAD(bin_ghost_pad),
+                    decoder_src_pad)) {
+                g_printerr("Failed to link decoder src pad to source bin ghost pad\n");
+            }
+            gst_object_unref(bin_ghost_pad);
+        } else {
+            g_printerr("Error: Decodebin did not pick nvidia decoder plugin.\n");
+        }
+    }
+}
+
+static void
+decodebin_child_added(GstChildProxy* child_proxy, GObject* object,
+    gchar* name, gpointer user_data)
+{
+    // g_print("Decodebin child added: %s\n", name);
+    if (g_strrstr(name, "decodebin") == name) {
+        g_signal_connect(G_OBJECT(object), "child-added",
+            G_CALLBACK(decodebin_child_added), user_data);
+    }
+    if (g_strrstr(name, "source") == name) {
+        g_object_set(G_OBJECT(object), "drop-on-latency", true, NULL);
+    }
+}
+
+static GstElement*
+create_source_bin(guint index, gchar* uri)
+{
+    std::cout << "Create Source Bin CALLED with " << uri << "\n";
+    GstElement *bin = NULL, *uri_decode_bin = NULL;
+    gchar bin_name[16] = {};
+
+    g_snprintf(bin_name, 15, "source-bin-%02d", index);
+    /* Create a source GstBin to abstract this bin's content from the rest of the
+     * pipeline */
+    bin = gst_bin_new(bin_name);
+
+    /* Source element for reading from the uri.
+     * We will use decodebin and let it figure out the container format of the
+     * stream and the codec and plug the appropriate demux and decode plugins. */
+    if (PERF_MODE) {
+        uri_decode_bin = gst_element_factory_make("nvurisrcbin", "uri-decode-bin");
+        g_object_set(G_OBJECT(uri_decode_bin), "file-loop", FALSE, NULL);
+        g_object_set(G_OBJECT(uri_decode_bin), "cudadec-memtype", 0, NULL);
+    } else {
+        uri_decode_bin = gst_element_factory_make("uridecodebin", "uri-decode-bin");
+    }
+
+    if (!bin || !uri_decode_bin) {
+        g_printerr("One element in source bin could not be created.\n");
+        return NULL;
+    }
+
+    /* We set the input uri to the source element */
+    g_object_set(G_OBJECT(uri_decode_bin), "uri", uri, NULL);
+
+    /* Connect to the "pad-added" signal of the decodebin which generates a
+     * callback once a new pad for raw data has beed created by the decodebin */
+    g_signal_connect(G_OBJECT(uri_decode_bin), "pad-added",
+        G_CALLBACK(cb_newpad), bin);
+    g_signal_connect(G_OBJECT(uri_decode_bin), "child-added",
+        G_CALLBACK(decodebin_child_added), bin);
+
+    gst_bin_add(GST_BIN(bin), uri_decode_bin);
+
+    /* We need to create a ghost pad for the source bin which will act as a proxy
+     * for the video decoder src pad. The ghost pad will not have a target right
+     * now. Once the decode bin creates the video decoder and generates the
+     * cb_newpad callback, we will set the ghost pad target to the video decoder
+     * src pad. */
+    if (!gst_element_add_pad(bin, gst_ghost_pad_new_no_target("src", GST_PAD_SRC))) {
+        g_printerr("Failed to add ghost pad in source bin\n");
+        return NULL;
+    }
+
+    return bin;
+}
+
+int main(int argc, char* argv[])
+{
+
+    GMainLoop* loop = NULL;
+    GstElement *pipeline = NULL, *streammux = NULL, *sink = NULL,
+               *pgie = NULL, 
+               *tracker = NULL, 
+               *nvvidconv = NULL,
+               *tiler = NULL, *nvosd = NULL, *fakesink;
+    GstElement *msgconv = NULL, *msgbroker = NULL, *tee = NULL;
+    GstElement *queue1 = NULL, *queue2 = NULL;
+    GstPad *tee_render_pad = NULL;
+    GstPad *tee_msg_pad = NULL;
+    GstPad *sink_pad = NULL;
+    GstPad *src_pad = NULL;
+
+    GstBus* bus = NULL;
+    guint bus_watch_id;
+
+    GstPad* pgie_src_pad = NULL;
+    GstPad* tiler_sink_pad = NULL;
+    guint i = 0, num_sources = 0;
+    guint gpu_id = 0;
+
+    int current_device = -1;
+    cudaGetDevice(&current_device);
+    struct cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, current_device);
+
+    /* Standard GStreamer initialization */
+    gst_init(&argc, &argv);
+    loop = g_main_loop_new(NULL, FALSE);
+
+    // Create Pipeline element that will form a connection of other elements
+    pipeline = gst_pipeline_new("pipeline");
+    // Create nvstreammux instance to form batches from one or more sources
+    streammux = gst_element_factory_make("nvstreammux", "stream-muxer");
+    gst_bin_add(GST_BIN(pipeline), streammux);
+
+    /*
+    Create Source bins for all the streams (4 in this case)
+    */
+    GList* src_list = NULL;
+
+    for (i = 0; i < STREAMS.size(); i++) {
+        GstPad *sinkpad, *srcpad;
+        gchar pad_name[16] = {};
+
+        GstElement* source_bin = NULL;
+        auto full_path = std::string(DATA_ROOT) + "/" + STREAMS[i];
+        source_bin = create_source_bin(i, (gchar*)full_path.c_str());
+        if (!source_bin) {
+            g_printerr("Failed to create source bin. Exiting.\n");
+            return -1;
+        }
+        gst_bin_add(GST_BIN(pipeline), source_bin);
+        g_snprintf(pad_name, 15, "sink_%u", i);
+        sinkpad = gst_element_request_pad_simple(streammux, pad_name);
+        if (!sinkpad) {
+            g_printerr("Streammux request sink pad failed. Exiting.\n");
+            return -1;
+        }
+        srcpad = gst_element_get_static_pad(source_bin, "src");
+        if (!srcpad) {
+            g_printerr("Failed to get src pad of source bin. Exiting.\n");
+            return -1;
+        }
+
+        if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
+            g_printerr("Failed to link source bin to stream muxer. Exiting.\n");
+            return -1;
+        }
+        gst_object_unref(srcpad);
+        gst_object_unref(sinkpad);
+    }
+
+    if (!pipeline || !streammux) {
+        g_printerr("One element could not be created. Exiting.\n");
+        return -1;
+    }
+
+    g_object_set(G_OBJECT(streammux),
+        "batch-size", STREAMS.size(),
+        "width", MUXER_OUTPUT_WIDTH,
+        "height", MUXER_OUTPUT_HEIGHT,
+        "batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC,
+        "sync-inputs", TRUE,
+        "live-source", 0,
+        "attach-sys-ts", 1,
+        NULL);
+
+    // PGIE, Ensure pgie_config.txt does NOT have roi-file-path here!
+    pgie = gst_element_factory_make("nvinfer", "primary-inference");
+    g_object_set(G_OBJECT(pgie), "config-file-path", "pgie_config.txt", NULL);
+
+    // Tracker
+    tracker = gst_element_factory_make("nvtracker", "tracker");
+    if (!tracker) {
+        g_printerr("Failed to create nvtracker element.\n");
+    } else {
+        g_object_set(G_OBJECT(tracker),
+            "ll-lib-file", "/opt/nvidia/deepstream/deepstream-7.1/lib/libnvds_nvmultiobjecttracker.so",
+            "ll-config-file", "/opt/nvidia/deepstream/deepstream-7.1/peopletrack/mcmt/config_tracker_NvDeepSORT_MK.yml",
+            "tracker-width", 960,
+            "tracker-height", 544,
+            "display-tracking-id", 1,
+            "user-meta-pool-size", 1024,
+            NULL);
+    }
+
+    // Tiler
+    tiler = gst_element_factory_make("nvmultistreamtiler", "nvtiler");
+    g_object_set(G_OBJECT(tiler),
+        "rows", 2,
+        "columns", 2,
+        "width", TILED_OUTPUT_WIDTH,
+        "height", TILED_OUTPUT_HEIGHT,
+        NULL);
+
+    /* Use convertor to convert from NV12 to RGBA as required by nvosd */
+    nvvidconv = gst_element_factory_make("nvvideoconvert", "converter");
+    /* Create OSD to draw on the converted RGBA buffer */
+    nvosd = gst_element_factory_make("nvdsosd", "onscreendisplay");
+    g_object_set(G_OBJECT(nvosd), "process-mode", 1, NULL);
+    g_object_set(G_OBJECT(nvosd), "display-text", 1, NULL);
+
+    /* Create msg converter to generate payload from buffer metadata */
+    msgconv = gst_element_factory_make ("nvmsgconv", "nvmsg-converter");
+
+    /* Create msg broker to send payload to server */
+    msgbroker = gst_element_factory_make ("nvmsgbroker", "nvmsg-broker");
+
+
+    // g_object_set (G_OBJECT (msgconv), "config", MSCONV_CONFIG_FILE, NULL);
+    g_object_set (G_OBJECT (msgconv), "payload-type", 257, NULL);
+    g_object_set (G_OBJECT (msgconv), "msg2p-newapi", 1, NULL);
+    g_object_set (G_OBJECT (msgconv), "frame-interval", 1, NULL);
+    g_object_set (G_OBJECT (msgconv), "msg2p-lib", "/opt/nvidia/deepstream/deepstream-7.1/peopletrack/mcmt/lib/libnvds_msgconv.so", NULL); 
+    // g_object_set (G_OBJECT (msgconv), "debug-payload-dir", "/opt/nvidia/deepstream/deepstream-7.1/sources/apps/sample_apps/deepstream-test4/msgs", NULL);
+
+
+    g_object_set (G_OBJECT (msgbroker),
+     "proto-lib","/opt/nvidia/deepstream/deepstream-7.1/lib/libnvds_kafka_proto.so",
+      "conn-str", "localhost;9092", 
+      "sync", TRUE, NULL);
+    g_object_set (G_OBJECT (msgbroker), "topic", "t2", NULL);
+    // g_object_set (G_OBJECT (msgbroker), "config", "/opt/nvidia/deepstream/deepstream-7.1/peopletrack/mcmt/cfg_kafka.txt", NULL);
+
+
+    /* Create tee to render buffer and send message simultaneously */
+    tee = gst_element_factory_make ("tee", "nvsink-tee");
+
+    /* Create queues */
+    queue1 = gst_element_factory_make ("queue", "nvtee-que1");
+    queue2 = gst_element_factory_make ("queue", "nvtee-que2");
+
+    if (!msgconv || !msgbroker || !tee|| !queue1 || !queue2) {
+        g_printerr ("One element could not be created. Exiting.\n");
+        return -1;
+  }
+
+    // sink = gst_element_factory_make("fakesink", "fakesink"); // fakesink
+    /* Finally render the osd output */
+    if (PERF_MODE) {
+        sink = gst_element_factory_make("nveglglessink", "nvvideo-renderer"); // fakesink
+    } else {
+        /* Finally render the osd output */
+        if (prop.integrated) {
+            sink = gst_element_factory_make("nv3dsink", "nv3d-sink");
+        } else {
+#ifdef __aarch64__
+            sink = gst_element_factory_make("nv3dsink", "nvvideo-renderer");
+#else
+            sink = gst_element_factory_make("nveglglessink", "nvvideo-renderer");
+#endif
+        }
+    }
+
+    // GstElement* fsink = gst_element_factory_make("fakesink", "fakesink"); // fakesink
+
+    g_object_set(sink, "sync", FRAME_SYNC, NULL);
+
+    /* we add a message handler */
+    bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
+    bus_watch_id = gst_bus_add_watch(bus, bus_call, loop);
+    gst_object_unref(bus);
+
+    //  Set up the pipeline
+    // we add all elements into the pipeline
+    gst_bin_add_many(GST_BIN(pipeline),
+        streammux, pgie, tracker,
+        tiler, nvvidconv, nvosd,
+        tee, queue1,queue2, msgconv,msgbroker,
+        sink,
+        NULL);
+    g_print("Added elements to bin\n");
+
+    // we link the elements together
+    if (!gst_element_link_many(streammux, pgie,tracker,
+            tiler, nvvidconv, nvosd, 
+            tee,
+            // sink,
+            NULL)) {
+        g_printerr("Elements could not be linked. Exiting.\n");
+        return -1;
+    }
+
+    if (!gst_element_link_many (queue1, msgconv, msgbroker, NULL)) {
+        g_printerr ("Elements could not be linked. Exiting.\n");
+        return -1;
+    }
+
+    if (!gst_element_link_many (queue2, sink, NULL)) {
+        g_printerr ("Elements could not be linked. Exiting.\n");
+        return -1;
+    }
+
+    sink_pad = gst_element_get_static_pad (queue1, "sink");
+    tee_msg_pad = gst_element_request_pad_simple (tee, "src_%u");
+    tee_render_pad = gst_element_request_pad_simple (tee, "src_%u");
+    if (!tee_msg_pad || !tee_render_pad) {
+        g_printerr ("Unable to get request pads\n");
+        return -1;
+    }
+
+    
+    if (gst_pad_link (tee_msg_pad, sink_pad) != GST_PAD_LINK_OK) {
+        g_printerr ("Unable to link tee and message converter\n");
+        gst_object_unref (sink_pad);
+        return -1;
+    }
+
+    gst_object_unref (sink_pad);
+
+    sink_pad = gst_element_get_static_pad (queue2, "sink");
+    if (gst_pad_link (tee_render_pad, sink_pad) != GST_PAD_LINK_OK) {
+        g_printerr ("Unable to link tee and render\n");
+        gst_object_unref (sink_pad);
+        return -1;
+    }
+
+    gst_object_unref (sink_pad);
+
+
+    // pgie_src_pad = gst_element_get_static_pad(pgie, "src");
+    // /* Create Context for Object Encoding.
+    //  * Takes GPU ID as a parameter. Passed by user through commandline.
+    //  * Initialized as 0. */
+    // NvDsObjEncCtxHandle obj_ctx_handle = nvds_obj_enc_create_context(gpu_id);
+    // if (!obj_ctx_handle) {
+    //     g_print("Unable to create context\n");
+    //     return -1;
+    // }
+    // if (!pgie_src_pad)
+    //     g_print("Unable to get src pad\n");
+    // else
+    //     gst_pad_add_probe(pgie_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
+    //         pgie_src_pad_buffer_probe, (gpointer)obj_ctx_handle, NULL);
+    // gst_object_unref(pgie_src_pad);
+
+    std::shared_ptr<BevProbeContext> ctx = std::make_shared<BevProbeContext>();
+
+    GstPad* tracker_src_pad = gst_element_get_static_pad(tracker, "src"); // Correct pad name: "src" not "source"
+    if (!tracker_src_pad) {
+        g_printerr("Failed to get tracker src pad\n");
+    } else {
+        gst_pad_add_probe(
+            tracker_src_pad,
+            GST_PAD_PROBE_TYPE_BUFFER,
+            (GstPadProbeCallback)tracker_src_pad_buffer_probe,
+            ctx.get(), // user_data, optional
+            NULL // GDestroyNotify, optional
+        );
+
+        gst_object_unref(tracker_src_pad);
+    }
+
+    tiler_sink_pad = gst_element_get_static_pad(tiler, "sink");
+
+    gst_pad_add_probe(tiler_sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
+        tiler_sink_pad_buffer_probe,
+        ctx.get(),
+        NULL);
+
+    gst_object_unref(tiler_sink_pad);
+    /* Set the pipeline to "playing" state */
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    /* Wait till pipeline encounters an error or EOS */
+    g_print("Running...\n");
+    g_main_loop_run(loop);
+
+
+
+    /* Destroy context for Object Encoding */
+    // nvds_obj_enc_destroy_context(obj_ctx_handle);
+
+    /* Release the request pads from the tee, and unref them */
+    gst_element_release_request_pad (tee, tee_msg_pad);
+    gst_element_release_request_pad (tee, tee_render_pad);
+    gst_object_unref (tee_msg_pad);
+    gst_object_unref (tee_render_pad);
+    /* Out of the main loop, clean up nicely */
+    g_print("Returned, stopping playback\n");
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    g_print("Deleting pipeline\n");
+    gst_object_unref(GST_OBJECT(pipeline));
+    g_source_remove(bus_watch_id);
+    g_main_loop_unref(loop);
+    return 0;
+}

@@ -1,0 +1,22 @@
+[sensor0]
+enable=1
+type=Camera
+id=139
+description=None
+coordinate=5.2;10.1;11.2
+
+
+[place0]
+enable=1
+id=1
+type=garage
+name=XYZ
+location=30.32;-40.55;100.0
+coordinate=1.0;2.0;3.0
+
+[analytics0]
+enable=0
+id=XYZ
+description="people Detection and Tracker"
+source=Sentics
+version=1.0

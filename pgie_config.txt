@@ -1,0 +1,23 @@
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+model-engine-file=./models/resnet34_peoplenet_int8.onnx_b4_gpu0_fp16.engine
+onnx-file=./models/resnet34_peoplenet_int8.onnx
+labelfile-path=./models/labels.txt
+batch-size=4
+network-mode=2
+num-detected-classes=1
+interval=0
+gie-unique-id=1
+## 1=DBSCAN, 2=NMS, 3= DBSCAN+NMS Hybrid, 4 = None(No clustering)
+cluster-mode=2
+output-tensor-meta=1
+
+
+
+[class-attrs-all]
+pre-cluster-threshold=0.5
+topk=10
+nms-iou-threshold=0.5
+detected-min-w=40
+detected-min-h=40
