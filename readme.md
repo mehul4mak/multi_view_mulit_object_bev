@@ -19,7 +19,7 @@ This project implements a **multi-camera, multi-object tracking (MCMT)** pipelin
 ## 📁 Project Structure
 
     .
-    ├── app/ # DeepStream C++ application
+    ├── app# DeepStream C++ application
     ├── lib/ # Custom .so files (e.g., nvmsgconv)
     ├── models/ # Object detection and ReID models
     ├── bev_visualizer.py # Kafka-based BEV visualization
@@ -46,12 +46,12 @@ sudo apt-get install -y \
 ### Running the Application
 1. Start the DeepStream C++ App
 ```
-./app/app      # Or use a provided run script
+./app    # Or use a provided run script
 ```
 
 2. Run the BEV Visualizer (Python)
 ```
-python3 bev_visualizer.py
+python3 bev_Viz_v2.py
 ```
 Make sure your Kafka broker is running and accessible.
 
