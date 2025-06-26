@@ -2,6 +2,12 @@
 
 This project implements a **multi-camera, multi-object tracking (MCMT)** pipeline with a **Bird’s Eye View (BEV)** visualization overlay. Built using **DeepStream 7.1 in C++**, it transmits metadata over **Kafka**, which is consumed by a **Python-based BEV visualizer**.
 
+Please note the following:
+* Used need to arrange data for cam_139.mp4, cam_140.mp4, , cam_142.mp4, , cam_52.mp4. I will add them later via git lfs.
+* BEV Viz.py have a scope of improvement and that may be commited in near future.
+* FPS improvements can be done with custom CUDA kernal or offloading CPU intensive work (tracker).
+
+
 ---
 
 ## 🚀 Features
